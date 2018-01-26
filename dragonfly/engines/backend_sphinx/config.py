@@ -27,7 +27,22 @@ PYAUDIO_STREAM_KEYWORD_ARGS = {
 # User language for the engine to use.
 LANGUAGE = "en"
 
-# Timeout in seconds for speaking the next part of a rule involving dictation.
-# This does not include the first part of such a rule. If this value is set to 0,
-# then there will be no timeout.
-NEXT_PART_TIMEOUT = 2.0
+# Timeout in seconds for speaking the next part of a rule involving dictation. Rules
+# like this currently have to be pronounced with pauses between grammar and
+# dictation parts. The timeout does not include the first part of such rules.
+# If this value is 0, there will be no timeout.
+NEXT_PART_TIMEOUT = 1
+
+# Timeout in seconds for starting repetition of a rule involving dictation.
+# This is for rules that wrap elements in a Repetition element, perhaps for command
+# chaining, and only applies to rules that have been completely spoken one or more
+# times.
+# If timeout occurs before speech is started, then the rule is processed, otherwise
+# a repetition of the rule starts. If there is currently one or more complete
+# recognitions and a further repetition is not completed, then the words
+# recognised so far will processed.
+# If this value is 0, the engine will process repeating rules as soon as one
+# complete recognition happens.
+# If this value is -1, the engine will wait until there is an incomplete recognition
+# to process the repetitions.
+REPETITION_TIMEOUT = 0

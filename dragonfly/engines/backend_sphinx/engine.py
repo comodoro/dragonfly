@@ -24,13 +24,14 @@ Engine class for CMU Pocket Sphinx
 
 import time
 import sys
+from threading import Timer
 
 from jsgf import GrammarError
 from jsgf.ext import SequenceRule, DictationGrammar, only_dictation_in_expansion
 from pyaudio import PyAudio
 
 import dragonfly.grammar.state as state_
-from dragonfly import Grammar, Window
+from dragonfly import Grammar, Window, Repetition, RuleRef
 from dragonfly.engines.backend_sphinx import is_engine_available
 from dragonfly2jsgf import Translator, LinkedRule
 from .compiler import SphinxJSGFCompiler
@@ -80,7 +81,13 @@ class SphinxEngine(EngineBase):
         self._recognising = False
         self._recognition_paused = False  # used in pausing/resuming recognition
         self._cancel_recognition_next_time = False
+
+        # Variables used for next part and repetition timeouts
         self._last_recognition_time = None
+        self.rep_timeout_timer = None
+
+        # Variable for storing the words_list for a repeating SequenceRule
+        self._repeating_rules_words_list = []
 
     @property
     def config(self):
@@ -103,7 +110,7 @@ class SphinxEngine(EngineBase):
         """
         attributes = [
             "DECODER_CONFIG", "PYAUDIO_STREAM_KEYWORD_ARGS", "LANGUAGE",
-            "NEXT_PART_TIMEOUT"
+            "NEXT_PART_TIMEOUT", "REPETITION_TIMEOUT"
         ]
         for attr in attributes:
             assert hasattr(engine_config, attr), "invalid engine configuration: " \
@@ -150,9 +157,11 @@ class SphinxEngine(EngineBase):
         self._decoder = None
         self._audio_buffers = []
 
-        # Reset the root grammar
+        # Reset the root grammar and other variables
         self._root_grammar = DictationGrammar()
         self._in_progress_sequence_rules = []
+        self.rep_timeout_timer = None
+        self._repeating_rules_words_list = []
 
     def disconnect(self):
         """
@@ -383,12 +392,32 @@ class SphinxEngine(EngineBase):
         """
         Internal method for handling whether the current recognition started too
         late. If it did, this method reprocesses the audio buffers read so far using
-        the default search, which might be the dictation (LM) or JSGF search,
+        the default search, which might be the dictation (LM) or a JSGF search,
         depending on whether there are active JSGF only rules.
 
         The timeout period is specific to rules containing Dictation elements which
         must be recognised in sequence.
         """
+        # Check if the repetition timer is active and hasn't finished yet.
+        current_time = time.time()
+        repetition_timeout = self.config.REPETITION_TIMEOUT
+
+        if not self._last_recognition_time:
+            self._last_recognition_time = current_time
+            return
+
+        timed_out = current_time >= self._last_recognition_time + repetition_timeout
+        if timed_out and self.rep_timeout_timer and self.rep_timeout_timer.isAlive:
+            # Cancel the timer
+            self.rep_timeout_timer.cancel()
+
+            # Wait for the timer to finish; it may have started already and is
+            # currently processing a repeating rule.
+            self.rep_timeout_timer.join()
+
+            # Clear the timer and return.
+            self.rep_timeout_timer = None
+
         # If the timeout period is 0 or no SequenceRule is in progress, then there
         # is no timeout.
         next_part_timeout = self.config.NEXT_PART_TIMEOUT
@@ -400,7 +429,6 @@ class SphinxEngine(EngineBase):
             "recognition time"
 
         # Check if the next part of the rule wasn't spoken in time.
-        current_time = time.time()
         timed_out = current_time >= self._last_recognition_time + next_part_timeout
         if next_part_timeout and timed_out:
             self._log.info("Recognition time-out after %d ms"
@@ -573,22 +601,45 @@ class SphinxEngine(EngineBase):
                 wrapper, df_rule = self._get_grammar_wrapper_and_rule(rule)
                 words_list = self._generate_words_list(rule, True)
 
-                # Process the complete recognition and break out of the loop; only
-                # one rule should match.
-                self._process_complete_recognition(wrapper, words_list)
+                # Add the word list to the repeating words list if the rule is
+                # related to a SequenceRule that can be repeated.
+                original = self._root_grammar.get_original_rule(rule)
+                related = list(self._root_grammar.get_generated_rules(original))
+                related.remove(rule)
+                should_repeat = False
+                for r in related:
+                    if isinstance(r, SequenceRule) and r.can_repeat:
+                        should_repeat = True
+                        break
+
+                if should_repeat:
+                    self._repeating_rules_words_list.append(words_list)
+
+                    # Also call _process_repeating_words_list
+                    repetition_timeout = self.config.REPETITION_TIMEOUT
+                    self._process_repeating_words_list(wrapper, repetition_timeout)
+                else:
+                    # Process the complete recognition and break out of the loop; only
+                    # one rule should match.
+                    self._process_complete_recognition(wrapper, words_list)
                 break
         return matching_rules
 
     def _reset_all_sequence_rules(self):
         """
         Internal method for resetting all active SequenceRules and clearing the
-        in-progress list.
+        in-progress list. Also enable any disabled rules.
         """
         for r in self._root_grammar.rules:
             if isinstance(r, SequenceRule):
                 r.restart_sequence()
 
         self._in_progress_sequence_rules = []
+        self._repeating_rules_words_list = []
+
+        # Also ensure all active rules are enabled.
+        for r in self._root_grammar.match_rules:
+            self._root_grammar.enable_rule(r)
 
     def _handle_in_progress_sequence_rules(self, speech):
         """
@@ -650,8 +701,16 @@ class SphinxEngine(EngineBase):
         # Load a JSGF Pocket Sphinx search with just the rules in the list, or
         # switch to the dictation search if there are only dictation rules.
         if self._in_progress_sequence_rules:
-            temp_grammar = DictationGrammar(rules=self._in_progress_sequence_rules)
-            compiled = temp_grammar.compile_grammar(language_name=self.language)
+            # Disable all rules and enable only those rules that we need
+            rules_to_keep = self._in_progress_sequence_rules
+            for rule in self._root_grammar.match_rules:
+                if rule not in rules_to_keep:
+                    self._root_grammar.disable_rule(rule)
+                else:
+                    self._root_grammar.enable_rule(rule)
+            compiled = self._root_grammar.compile_grammar(
+                language_name=self.language
+            )
             if not compiled:
                 self._set_dictation_search()
             else:
@@ -660,6 +719,34 @@ class SphinxEngine(EngineBase):
                 self._decoder.active_search = name
         return result
 
+    def _process_repeating_words_list(self, wrapper, n):
+        """
+        Process the repeating rules words list after n seconds. If n is 0, the list
+        is processed immediately.
+        Note that n can be a float.
+        :type wrapper: GrammarWrapper
+        :type n: float
+        """
+        def process():
+            if not self._repeating_rules_words_list:
+                return
+
+            # Flatten the current words list and process it. The list gets
+            # cleared during processing.
+            new_list = []
+            for wl in self._repeating_rules_words_list:
+                new_list.extend(wl)
+            self._process_complete_recognition(
+                wrapper, new_list
+            )
+
+        # Start a timer that will call the local process method after n seconds
+        self.rep_timeout_timer = Timer(n, process)
+        self.rep_timeout_timer.start()
+
+        if n == 0:
+            self.rep_timeout_timer.join()
+
     def _handle_complete_sequence_rule(self, rule):
         """
         Handle a SequenceRule that has been completely matched.
@@ -667,10 +754,67 @@ class SphinxEngine(EngineBase):
         """
         # Get the GrammarWrapper and dragonfly rule from the SequenceRule
         wrapper, df_rule = self._get_grammar_wrapper_and_rule(rule)
+
         # Generate a words list
         words_list = self._generate_words_list(rule, True)
 
-        self._process_complete_recognition(wrapper, words_list)
+        if not rule.can_repeat:
+            self._process_complete_recognition(wrapper, words_list)
+            return
+
+        # Handle rules that can be repeated
+        # Add the rule's words_list to existing list
+        self._repeating_rules_words_list.append(words_list)
+
+        # Check that the rule can repeat again
+        repetitions = len(self._repeating_rules_words_list)
+
+        # Find the dragonfly Repetition element
+        def find_root_repetition(element):
+            if isinstance(element, Repetition):
+                return element
+            elif isinstance(element, RuleRef):
+                return find_root_repetition(element.rule.element)
+            elif len(element.children) == 1:
+                for c in element.children:
+                    result = find_root_repetition(c)
+                    if result:
+                        return result
+
+        rep_element = find_root_repetition(df_rule.element)
+        assert isinstance(rep_element, Repetition), \
+            "Repeating rule involving Dictation must have some Repetition " \
+            "element"
+        if repetitions == rep_element.max:
+            # No more repetitions. Process now.
+            self._process_repeating_words_list(wrapper, 0)
+            return
+
+        # Restart the rule to allow it to match and set the appropriate search
+        rule.restart_sequence()
+        self._in_progress_sequence_rules = []
+        if not rule.current_is_dictation_only:
+            # Set and load SeqRulesInProgress
+            original = self._root_grammar.get_original_rule(rule)
+            for r in self._root_grammar.match_rules:
+                if isinstance(r, SequenceRule):
+                    r.restart_sequence()
+                if self._root_grammar.get_original_rule(r) == original:
+                    self._root_grammar.enable_rule(r)
+                else:
+                    self._root_grammar.disable_rule(r)
+            name = "SeqRulesInProgress"
+            compiled = self._root_grammar.compile_grammar(
+                language_name=self.language
+            )
+            self._decoder.set_jsgf_string(name, compiled)
+        elif not self.recognising_dictation:
+            self._set_dictation_search()
+
+        # Only start processing if the timeout value is not negative
+        repetition_timeout = self.config.REPETITION_TIMEOUT
+        if repetition_timeout >= 0:
+            self._process_repeating_words_list(wrapper, repetition_timeout)
 
     def recognise_forever(self):
         """
