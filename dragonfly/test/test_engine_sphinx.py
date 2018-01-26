@@ -12,6 +12,8 @@ from dragonfly import *
 from dragonfly import List as DragonflyList, DictList as DragonflyDict
 from dragonfly.engines.backend_sphinx.engine import SphinxEngine
 
+dgndictation = 1000000  # dictation rule id
+
 
 class SphinxEngineCase(unittest.TestCase):
     """
@@ -123,7 +125,8 @@ class BasicEngineTests(SphinxEngineCase):
             "DECODER_CONFIG",
             "LANGUAGE",
             "PYAUDIO_STREAM_KEYWORD_ARGS",
-            "NEXT_PART_TIMEOUT"
+            "NEXT_PART_TIMEOUT",
+            "REPETITION_TIMEOUT"
         ]
 
         class TestConfig(object):
@@ -131,6 +134,7 @@ class BasicEngineTests(SphinxEngineCase):
             LANGUAGE = "en"
             PYAUDIO_STREAM_KEYWORD_ARGS = {}
             NEXT_PART_TIMEOUT = 0
+            REPETITION_TIMEOUT = 0
 
         def set_config(value):
             self.engine.config = value
@@ -549,7 +553,182 @@ class DictationEngineTests(SphinxEngineCase):
         self.assert_test_function_called(test2, 2)
 
 
-# ---------------------------------------------------------------------
+class EngineRepetitionTests(SphinxEngineCase):
+    """
+    Tests for the engine's repetition functionality.
+    """
+    def test_repeatable_rules(self):
+        """
+        Test a rule using Dictation elements within a Repetition element.
+        """
+        # Set a repetition timeout of 100 ms.
+        repetition_timeout = 0.1
+        self.engine.config.REPETITION_TIMEOUT = repetition_timeout
+
+        # Set up a test rule and grammar
+        test = self.get_test_function()
+
+        class TestRule(Rule):
+            def __init__(self, name):
+                super(TestRule, self).__init__(
+                    name,
+                    element=Repetition(Dictation(), max=3),
+                    exported=True
+                )
+
+            process_recognition = test
+
+        grammar = Grammar("test")
+        grammar.add_rule(TestRule("test"))
+        grammar.load()
+
+        # Register a RecognitionHistory observer for checking that rules are being
+        # repeated correctly
+        observer = RecognitionHistory()
+        observer.register()
+
+        # Check that the rule works correctly with one recognition
+        self.assert_mimic_success("hello world")
+
+        # Wait the full timeout duration and the rule should have been processed
+        time.sleep(repetition_timeout)
+        self.engine.rep_timeout_timer.join()  # wait until the timer thread ends
+        self.assert_test_function_called(test, 1)
+
+        # Check that the recognised words were correct
+        self.assertEqual(observer[len(observer) - 1], [
+            ("hello", dgndictation), ("world", dgndictation)
+        ])
+
+        # Test that it works with repetitions before timeout
+        self.assert_mimic_success("hello world")
+
+        time.sleep(repetition_timeout / 2)
+        self.assert_test_function_called(test, 1)  # no change
+
+        self.assert_mimic_success("testing")  # rule repeat
+        self.assert_test_function_called(test, 1)  # no change
+
+        # Wait the full timeout again and check that the rule was processed.
+        time.sleep(repetition_timeout)
+        self.engine.rep_timeout_timer.join()
+        self.assert_test_function_called(test, 2)  # second time processed
+
+        # Check that the recognised words were correct: 2 repetitions
+        self.assertEqual(observer[len(observer) - 1], [
+            ("hello", dgndictation), ("world", dgndictation),
+            ("testing", dgndictation)
+        ])
+
+        # Test that the rule won't allow more than 3 repetitions
+        self.assert_mimic_success("hello world")
+        self.assert_test_function_called(test, 2)  # no change
+
+        self.assert_mimic_success("testing", "testing")
+        self.engine.rep_timeout_timer.join()
+        self.assert_test_function_called(test, 3)
+        self.assertEqual(observer[len(observer) - 1], [
+            ("hello", dgndictation), ("world", dgndictation),
+            ("testing", dgndictation), ("testing", dgndictation)
+        ])
+
+    def test_repeatable_rules_complex(self):
+        """
+        Test rules using Dictation and Literal elements within a Repetition element.
+        """
+        # Set a repetition timeout of 100 ms
+        repetition_timeout = 0.1
+        self.engine.config.REPETITION_TIMEOUT = repetition_timeout
+
+        class SeriesMappingRule(CompoundRule):
+            """
+            SeriesMappingRule class for command chaining from:
+            https://github.com/dictation-toolbox/dragonfly-scripts
+            Licensed under LGPL3
+            """
+            def __init__(self, mapping, extras=None, defaults=None, name=None):
+                mapping_rule = MappingRule(name=name, mapping=mapping, extras=extras,
+                                           defaults=defaults, exported=False)
+                single = RuleRef(rule=mapping_rule)
+                series = Repetition(single, min=1, max=16, name="series")
+
+                compound_spec = "<series>"
+                compound_extras = [series]
+                CompoundRule.__init__(self, spec=compound_spec,
+                                      extras=compound_extras, exported=True)
+
+            def _process_recognition(self, node, extras):  # @UnusedVariable
+                series = extras["series"]
+                for action in series:
+                    action.execute()
+
+        # Set up test rules using test functions
+        test1 = self.get_test_function()
+        test2 = self.get_test_function()
+        test_rule = SeriesMappingRule(
+            mapping={
+                "hello <dictation>": Function(test1),
+                "testing": Function(test2),
+            },
+            extras=[Dictation("dictation")]
+        )
+
+        grammar = Grammar("test")
+        grammar.add_rule(test_rule)
+        grammar.load()
+        observer = RecognitionHistory()
+        observer.register()
+
+        def clear_obs_history():
+            # Clear observer history
+            for e in tuple(observer):
+                observer.remove(e)
+
+        # Test that non-dictation rules work correctly with repetition
+        self.assert_mimic_success("testing testing")
+        self.engine.rep_timeout_timer.join()
+        self.assertListEqual(observer, [
+            [("testing", 0), ("testing", 0)]
+        ])
+        self.assert_test_function_called(test1, 0)
+        self.assert_test_function_called(test2, 2)
+        clear_obs_history()
+
+        # Test that combinations of both mappings work
+        self.assert_mimic_success("hello", "world")
+        self.assert_test_function_called(test1, 0)  # no change
+        self.assert_mimic_success("testing")
+        self.assert_test_function_called(test2, 2)
+
+        self.engine.rep_timeout_timer.join()  # wait until the timer thread ends
+        self.assertListEqual(observer, [
+            [("hello", 0), ("world", dgndictation),  ("testing", 0)]
+        ])
+        self.assert_test_function_called(test1, 1)
+        self.assert_test_function_called(test2, 3)
+        clear_obs_history()
+
+        # Test a different combination
+        self.assert_mimic_success("testing")
+        self.assert_test_function_called(test2, 3)  # no change
+        self.assert_mimic_success("hello", "world")
+        self.assert_test_function_called(test1, 1)
+
+        self.engine.rep_timeout_timer.join()  # wait until the timer thread ends
+        self.assertListEqual(observer, [
+            [("testing", 0), ("hello", 0), ("world", dgndictation)]
+        ])
+        self.assert_test_function_called(test1, 2)
+        self.assert_test_function_called(test2, 4)
+
+    def test_no_repetition_timeout(self):
+        """
+        Test engine with repetition timeout value of -1.
+        """
+        # Set repetition timeout to -1.
+        repetition_timeout = -1
+        self.engine.config.REPETITION_TIMEOUT = repetition_timeout
+        self.fail()
 
 
 if __name__ == '__main__':
